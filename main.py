@@ -1,7 +1,17 @@
 import threading
+from urllib.parse import urlparse
 import flet as ft
 import flet_audio as fta
 import yt_dlp
+
+
+def is_safe_url(url: str) -> bool:
+    """Проверяет, что ссылка использует безопасный протокол HTTPS."""
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme == "https" and bool(parsed.netloc)
+    except Exception:
+        return False
 
 
 def main(page: ft.Page):
@@ -10,16 +20,13 @@ def main(page: ft.Page):
     page.bgcolor = "#030303"
     page.padding = 15
 
-    # Инициализация аудиоплеера для Android / Desktop
-    audio_player = fta.Audio(
-        src="https://github.com/mdn/webaudio-examples/blob/main/audio-basics/outfoxing.mp3?raw=true",
-        autoplay=False,
-    )
+    # Инициализация без обращения к сторонним сайтам при запуске
+    audio_player = fta.Audio(autoplay=False)
     page.overlay.append(audio_player)
 
     is_playing = False
+    is_busy = False  # Защита от спама потоками (Race Condition / Rate Limit)
 
-    # Элементы интерфейса
     status_text = ft.Text(
         "Выберите трек",
         size=14,
@@ -31,6 +38,7 @@ def main(page: ft.Page):
     results_list = ft.ListView(expand=True, spacing=8)
     search_input = ft.TextField(
         hint_text="Поиск песен или артистов...",
+        max_length=100,  # Ограничение длины запроса
         expand=True,
         bgcolor="#1a1a1a",
         border_radius=8,
@@ -39,9 +47,12 @@ def main(page: ft.Page):
     )
 
     def search_music(e):
-        query = search_input.value.strip()
-        if not query:
+        nonlocal is_busy
+        query = (search_input.value or "").strip()
+        if not query or is_busy:
             return
+
+        is_busy = True
         status_text.value = "⏳ Поиск треков..."
         results_list.controls.clear()
         page.update()
@@ -50,11 +61,13 @@ def main(page: ft.Page):
         ).start()
 
     def fetch_results(query):
+        nonlocal is_busy
         ydl_opts = {
             "format": "bestaudio/best",
             "noplaylist": True,
             "quiet": True,
             "extract_flat": True,
+            "socket_timeout": 10,  # Таймаут для защиты от зависания сети
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -63,15 +76,23 @@ def main(page: ft.Page):
 
             results_list.controls.clear()
             for t in tracks:
+                if not t:
+                    continue
                 title = t.get("title", "Без названия")
-                url = (
-                    t.get("url")
-                    or f"https://www.youtube.com/watch?v={t.get('id')}"
+                video_id = t.get("id")
+                url = t.get("url") or (
+                    f"https://www.youtube.com/watch?v={video_id}"
+                    if video_id
+                    else ""
                 )
+
+                if not is_safe_url(url):
+                    continue
+
                 duration = t.get("duration")
                 dur_str = (
                     f"{int(duration // 60)}:{int(duration % 60):02d}"
-                    if duration
+                    if isinstance(duration, (int, float))
                     else ""
                 )
 
@@ -97,11 +118,20 @@ def main(page: ft.Page):
                     )
                 )
             status_text.value = "Выберите трек для воспроизведения"
-        except Exception as ex:
-            status_text.value = f"Ошибка поиска: {ex}"
-        page.update()
+        except Exception:
+            status_text.value = (
+                "Не удалось выполнить поиск. Проверьте подключение к сети."
+            )
+        finally:
+            is_busy = False
+            page.update()
 
     def play_track(url, title):
+        nonlocal is_busy
+        if is_busy or not is_safe_url(url):
+            return
+
+        is_busy = True
         status_text.value = f"⏳ Загрузка потока: {title}"
         page.update()
         threading.Thread(
@@ -109,16 +139,20 @@ def main(page: ft.Page):
         ).start()
 
     def stream_audio(url, title):
-        nonlocal is_playing
-        # Предпочитаем m4a для лучшей совместимости с мобильным плеером Android
+        nonlocal is_playing, is_busy
         ydl_opts = {
             "format": "bestaudio[ext=m4a]/bestaudio",
             "quiet": True,
+            "noplaylist": True,
+            "socket_timeout": 10,
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                stream_url = info["url"]
+                stream_url = info.get("url", "")
+
+            if not is_safe_url(stream_url):
+                raise ValueError("Некорректный URL аудиопотока")
 
             audio_player.src = stream_url
             audio_player.autoplay = True
@@ -127,12 +161,16 @@ def main(page: ft.Page):
             is_playing = True
             play_btn.icon = ft.Icons.PAUSE_CIRCLE_FILLED
             status_text.value = f"🎵 {title}"
-        except Exception as ex:
-            status_text.value = f"Ошибка воспроизведения: {ex}"
-        page.update()
+        except Exception:
+            status_text.value = "Не удалось воспроизвести этот трек."
+        finally:
+            is_busy = False
+            page.update()
 
     def toggle_play(e):
         nonlocal is_playing
+        if not audio_player.src:
+            return
         if is_playing:
             audio_player.pause()
             play_btn.icon = ft.Icons.PLAY_CIRCLE_FILLED
@@ -150,7 +188,6 @@ def main(page: ft.Page):
         on_click=toggle_play,
     )
 
-    # Верхняя панель поиска
     search_bar = ft.Row(
         [
             search_input,
@@ -163,7 +200,6 @@ def main(page: ft.Page):
         ]
     )
 
-    # Нижняя панель плеера
     player_bar = ft.Container(
         content=ft.Row(
             [ft.Container(content=status_text, expand=True), play_btn],
@@ -174,7 +210,12 @@ def main(page: ft.Page):
         border_radius=12,
     )
 
-    page.add(search_bar, ft.Divider(color="transparent", height=5), results_list, player_bar)
+    page.add(
+        search_bar,
+        ft.Divider(color="transparent", height=5),
+        results_list,
+        player_bar,
+    )
 
 
 ft.app(target=main)
