@@ -218,4 +218,8 @@ def main(page: ft.Page):
     )
 
 
-ft.app(target=main)
+if __name__ == "__main__":
+    if hasattr(ft, "app"):
+        ft.app(target=main)
+    else:
+        ft.run(main)
